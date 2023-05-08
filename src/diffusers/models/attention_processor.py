@@ -386,11 +386,13 @@ class AttnProcessor:
         encoder_hidden_states=None,
         attention_mask=None,
     ):
+        print(f"Hidden states: {hidden_states.shape}")
         batch_size, sequence_length, _ = (
             hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
         attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
         query = attn.to_q(hidden_states)
+        print(f"Query shape: {query.shape}")
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -399,6 +401,7 @@ class AttnProcessor:
 
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
+        print(f"Key and value: {key.shape}, {value.shape}")
 
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
@@ -406,7 +409,9 @@ class AttnProcessor:
 
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
         hidden_states = torch.bmm(attention_probs, value)
+        print(f"hidden_states before batch to head dim: {hidden_states.shape}")
         hidden_states = attn.batch_to_head_dim(hidden_states)
+        print(f"hidden_states after batch to head dim: {hidden_states.shape}")
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
