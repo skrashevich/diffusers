@@ -348,6 +348,7 @@ def get_up_block(
             resnet_act_fn=resnet_act_fn,
             resnet_groups=resnet_groups,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            temb_channels=temb_channels
         )
     elif up_block_type == "AttnUpDecoderBlock2D":
         return AttnUpDecoderBlock2D(
@@ -360,6 +361,7 @@ def get_up_block(
             resnet_groups=resnet_groups,
             attn_num_head_channels=attn_num_head_channels,
             resnet_time_scale_shift=resnet_time_scale_shift,
+            temb_channels=temb_channels
         )
     elif up_block_type == "KUpBlock2D":
         return KUpBlock2D(
@@ -406,7 +408,6 @@ class UNetMidBlock2D(nn.Module):
         super().__init__()
         resnet_groups = resnet_groups if resnet_groups is not None else min(in_channels // 4, 32)
         self.add_attention = add_attention
-
         # there is always at least one resnet
         resnets = [
             ResnetBlock2D(
@@ -426,15 +427,23 @@ class UNetMidBlock2D(nn.Module):
 
         for _ in range(num_layers):
             if self.add_attention:
-                attentions.append(
-                    AttentionBlock(
-                        in_channels,
-                        num_head_channels=attn_num_head_channels,
-                        rescale_output_factor=output_scale_factor,
-                        eps=resnet_eps,
-                        norm_num_groups=resnet_groups,
+                if resnet_time_scale_shift == "spatial":
+                    attentions.append(
+                        MOVQAttention(
+                            in_channels,
+                            temb_channels,
+                            attn_num_head_channels
+                        ))
+                else:
+                    attentions.append(
+                        AttentionBlock(
+                            in_channels,
+                            num_head_channels=attn_num_head_channels,
+                            rescale_output_factor=output_scale_factor,
+                            eps=resnet_eps,
+                            norm_num_groups=resnet_groups,
+                        )
                     )
-                )
             else:
                 attentions.append(None)
 
@@ -460,7 +469,8 @@ class UNetMidBlock2D(nn.Module):
         hidden_states = self.resnets[0](hidden_states, temb)
         for attn, resnet in zip(self.attentions, self.resnets[1:]):
             if attn is not None:
-                hidden_states = attn(hidden_states)
+                hidden_states = attn(hidden_states, temb)
+
             hidden_states = resnet(hidden_states, temb)
 
         return hidden_states
@@ -1945,6 +1955,30 @@ class UpBlock2D(nn.Module):
         return hidden_states
 
 
+class MOVQAttention(nn.Module):
+    def __init__(self, query_dim, temb_channels, attn_num_head_channels):
+        super().__init__()
+
+        self.norm = SpatialNorm(query_dim, temb_channels)
+        num_heads = query_dim // attn_num_head_channels if attn_num_head_channels is not None else 1
+        dim_head = attn_num_head_channels if attn_num_head_channels is not None else query_dim
+        self.attention = Attention(
+                query_dim=query_dim,
+                heads=num_heads,
+                dim_head=dim_head, 
+                bias=True
+                )
+        
+    def forward(self, hidden_states, temb):
+        residual = hidden_states
+        hidden_states = self.norm(hidden_states, temb).view(hidden_states.shape[0], hidden_states.shape[1], -1)
+        hidden_states = self.attention(hidden_states.transpose(1, 2), None, None).transpose(1, 2)
+        hidden_states = hidden_states.view(residual.shape)
+        hidden_states = hidden_states + residual
+        return hidden_states
+            
+        
+
 class UpDecoderBlock2D(nn.Module):
     def __init__(
         self,
@@ -1959,6 +1993,7 @@ class UpDecoderBlock2D(nn.Module):
         resnet_pre_norm: bool = True,
         output_scale_factor=1.0,
         add_upsample=True,
+        temb_channels=None
     ):
         super().__init__()
         resnets = []
@@ -1970,7 +2005,7 @@ class UpDecoderBlock2D(nn.Module):
                 ResnetBlock2D(
                     in_channels=input_channels,
                     out_channels=out_channels,
-                    temb_channels=None,
+                    temb_channels=temb_channels,
                     eps=resnet_eps,
                     groups=resnet_groups,
                     dropout=dropout,
@@ -1988,9 +2023,9 @@ class UpDecoderBlock2D(nn.Module):
         else:
             self.upsamplers = None
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, temb=None):
         for resnet in self.resnets:
-            hidden_states = resnet(hidden_states, temb=None)
+            hidden_states = resnet(hidden_states, temb=temb)
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -2014,6 +2049,7 @@ class AttnUpDecoderBlock2D(nn.Module):
         attn_num_head_channels=1,
         output_scale_factor=1.0,
         add_upsample=True,
+        temb_channels=None
     ):
         super().__init__()
         resnets = []
@@ -2026,7 +2062,7 @@ class AttnUpDecoderBlock2D(nn.Module):
                 ResnetBlock2D(
                     in_channels=input_channels,
                     out_channels=out_channels,
-                    temb_channels=None,
+                    temb_channels=temb_channels,
                     eps=resnet_eps,
                     groups=resnet_groups,
                     dropout=dropout,
@@ -2036,15 +2072,24 @@ class AttnUpDecoderBlock2D(nn.Module):
                     pre_norm=resnet_pre_norm,
                 )
             )
-            attentions.append(
-                AttentionBlock(
-                    out_channels,
-                    num_head_channels=attn_num_head_channels,
-                    rescale_output_factor=output_scale_factor,
-                    eps=resnet_eps,
-                    norm_num_groups=resnet_groups,
+            if resnet_time_scale_shift == "spatial":
+                attentions.append(
+                    MOVQAttention(
+                        out_channels,
+                        temb_channels=temb_channels,
+                        attn_num_head_channels=attn_num_head_channels,
+                    )
                 )
-            )
+            else:
+                attentions.append(
+                    AttentionBlock(
+                        out_channels,
+                        num_head_channels=attn_num_head_channels,
+                        rescale_output_factor=output_scale_factor,
+                        eps=resnet_eps,
+                        norm_num_groups=resnet_groups,
+                    )
+                )
 
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
@@ -2054,10 +2099,10 @@ class AttnUpDecoderBlock2D(nn.Module):
         else:
             self.upsamplers = None
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, temb=None):
         for resnet, attn in zip(self.resnets, self.attentions):
-            hidden_states = resnet(hidden_states, temb=None)
-            hidden_states = attn(hidden_states)
+                hidden_states = resnet(hidden_states, temb=temb)
+                hidden_states = attn(hidden_states, temb)
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -2810,3 +2855,24 @@ class KAttentionBlock(nn.Module):
         hidden_states = attn_output + hidden_states
 
         return hidden_states
+
+class SpatialNorm(nn.Module):
+    """
+    Spatially conditioned normalization as defined in https://arxiv.org/abs/2209.09002
+    """
+    def __init__(
+        self,
+        f_channels,
+        zq_channels,
+    ):
+        super().__init__()
+        self.norm_layer = nn.GroupNorm(num_channels=f_channels,num_groups=32,eps=1e-6,affine=True)
+        self.conv_y = nn.Conv2d(zq_channels, f_channels, kernel_size=1, stride=1, padding=0)
+        self.conv_b = nn.Conv2d(zq_channels, f_channels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, f, zq):
+        f_size = f.shape[-2:]
+        zq = F.interpolate(zq, size=f_size, mode="nearest")
+        norm_f = self.norm_layer(f)
+        new_f = norm_f * self.conv_y(zq) + self.conv_b(zq)
+        return new_f
